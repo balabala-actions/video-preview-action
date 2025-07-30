@@ -1,0 +1,555 @@
+name: 生成视频截图
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: '视频 URL'
+        required: true
+        type: string
+      preset:
+        description: '预设模式'
+        required: false
+        default: 'dynamic'
+        type: choice
+        options:
+        - movie
+        - lecture
+        - quick
+        - dynamic
+      target_repo:
+        description: '发布到的仓库'
+        required: false
+        default: 'balabala-actions/private-screenshots'
+        type: string
+      custom_filename:
+        description: '自定义文件名（可选，不含扩展名，用于重命名下载的视频文件）'
+        required: false
+        type: string
+
+
+permissions:
+  contents: read
+
+jobs:
+  generate-screenshots:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+    
+    - name: 验证输入
+      run: |
+        if [[ ! "$VIDEO_URL" =~ ^https?:// ]]; then
+          echo "❌ 无效的 URL 格式"
+          exit 1
+        fi
+        echo "✅ URL 验证通过"
+
+        # 验证自定义文件名（如果提供）
+        if [ -n "$CUSTOM_FILENAME" ]; then
+          # 检查是否包含不安全的字符
+          if [[ "$CUSTOM_FILENAME" =~ [\<\>\:\"\|\?\*\/\\] ]]; then
+            echo "❌ 自定义文件名包含不安全的字符: $CUSTOM_FILENAME"
+            echo "请避免使用以下字符: < > : \" | ? * / \\"
+            exit 1
+          fi
+          # 检查长度
+          if [ ${#CUSTOM_FILENAME} -gt 100 ]; then
+            echo "❌ 自定义文件名过长（超过100字符）: $CUSTOM_FILENAME"
+            exit 1
+          fi
+          echo "✅ 自定义文件名验证通过: $CUSTOM_FILENAME"
+        fi
+      env:
+        VIDEO_URL: ${{ inputs.video_url }}
+        CUSTOM_FILENAME: ${{ inputs.custom_filename }}
+    
+    - name: 设置 Hosts 映射
+      run: |
+        if [ -n "$HOSTS_MAPPING" ]; then
+          echo "🔧 设置 hosts 映射..."
+          echo "$HOSTS_MAPPING" | sudo tee -a /etc/hosts > /dev/null
+          echo "✅ Hosts 映射设置完成"
+        else
+          echo "ℹ️ 未设置 hosts 映射，跳过"
+        fi
+      env:
+        HOSTS_MAPPING: ${{ secrets.HOSTS_MAPPING }}
+    
+    - name: 下载视频
+      run: |
+        mkdir -p video_input
+
+        echo "⬇️ 正在获取视频资源..."
+        echo "🔗 URL: $VIDEO_URL"
+
+        # 从 URL 中提取原始文件名
+        URL_FILENAME=$(echo "$VIDEO_URL" | sed 's/.*\///' | sed 's/\?.*$//')
+        if [ -z "$URL_FILENAME" ] || [[ ! "$URL_FILENAME" =~ \. ]]; then
+          URL_FILENAME="video.mp4"
+        fi
+
+        echo "📝 URL中的文件名: $URL_FILENAME"
+
+        # 提取扩展名（统一处理）
+        if [[ "$URL_FILENAME" =~ \. ]]; then
+          EXTENSION="${URL_FILENAME##*.}"
+        else
+          EXTENSION="mp4"
+        fi
+
+        # 确定最终使用的文件名
+        if [ -n "${{ inputs.custom_filename }}" ]; then
+          # 1. 用户传入重命名参数，直接使用用户传入的名称
+          FINAL_FILENAME="${{ inputs.custom_filename }}.${EXTENSION}"
+          echo "📝 使用自定义文件名: $FINAL_FILENAME"
+        else
+          # 2. 用户未传入重命名参数，检测是否需要解码
+          if [[ "$URL_FILENAME" =~ %[0-9A-Fa-f]{2} ]]; then
+            # 检测到URL编码，进行解码
+            DECODED_FILENAME=$(printf '%b' "${URL_FILENAME//%/\\x}")
+            FINAL_FILENAME="$DECODED_FILENAME"
+            echo "📝 检测到URL编码，解码后: $FINAL_FILENAME"
+          else
+            # 无需解码
+            FINAL_FILENAME="$URL_FILENAME"
+            echo "📝 使用原始文件名: $FINAL_FILENAME"
+          fi
+        fi
+
+        echo "FINAL_FILENAME=$FINAL_FILENAME" >> $GITHUB_ENV
+        echo "URL_FILENAME=$URL_FILENAME" >> $GITHUB_ENV
+
+        # 首先获取文件信息
+        echo "📊 获取文件信息..."
+        CONTENT_LENGTH=$(curl -sI -L "$VIDEO_URL" | grep -i content-length | tail -1 | cut -d' ' -f2 | tr -d '\r')
+        if [ -n "$CONTENT_LENGTH" ] && [ "$CONTENT_LENGTH" -gt 0 ]; then
+          CONTENT_LENGTH_MB=$((CONTENT_LENGTH / 1024 / 1024))
+          echo "📏 文件大小: ${CONTENT_LENGTH_MB}MB"
+        else
+          echo "⚠️ 无法获取文件大小信息"
+        fi
+
+        # 使用 curl 下载到临时文件名
+        TEMP_FILENAME="temp_download_$(date +%s).tmp"
+        echo "⬇️ 开始下载..."
+        if curl -L --fail --progress-bar \
+               --connect-timeout 30 --max-time 3600 \
+               --user-agent "Mozilla/5.0 (compatible; VideoProcessor/1.0)" \
+               --output "video_input/$TEMP_FILENAME" \
+               --write-out "✅ 下载完成 - 实际大小: %{size_download} 字节 - 总用时: %{time_total}s - 平均速度: %{speed_download} B/s\n" \
+               "$VIDEO_URL"; then
+
+          # 验证文件并显示友好的大小
+          if [ -f "video_input/$TEMP_FILENAME" ] && [ -s "video_input/$TEMP_FILENAME" ]; then
+            FILE_SIZE=$(du -h "video_input/$TEMP_FILENAME" | cut -f1)
+            FILE_SIZE_BYTES=$(stat -c%s "video_input/$TEMP_FILENAME" 2>/dev/null || stat -f%z "video_input/$TEMP_FILENAME" 2>/dev/null)
+            echo "📊 最终文件大小: ${FILE_SIZE} (${FILE_SIZE_BYTES} 字节)"
+
+            # 验证文件完整性（如果有预期大小）
+            if [ -n "$CONTENT_LENGTH" ] && [ "$CONTENT_LENGTH" -gt 0 ]; then
+              if [ "$FILE_SIZE_BYTES" -eq "$CONTENT_LENGTH" ]; then
+                echo "✅ 文件完整性验证通过"
+              else
+                echo "⚠️ 文件大小不匹配 (预期: $CONTENT_LENGTH, 实际: $FILE_SIZE_BYTES)"
+              fi
+            fi
+
+            # 重命名临时文件到最终文件名
+            echo "🔄 重命名文件: $TEMP_FILENAME → $FINAL_FILENAME"
+            mv "video_input/$TEMP_FILENAME" "video_input/$FINAL_FILENAME"
+
+            if [ -f "video_input/$FINAL_FILENAME" ]; then
+              echo "✅ 文件重命名成功: $FINAL_FILENAME"
+            else
+              echo "❌ 文件重命名失败"
+              exit 1
+            fi
+          else
+            echo "❌ 下载的文件无效或为空"
+            exit 1
+          fi
+        else
+          echo "❌ 视频下载失败"
+          exit 1
+        fi
+      env:
+        VIDEO_URL: ${{ inputs.video_url }}
+    
+    - name: 生成截图
+      env:
+        TZ: Asia/Shanghai
+      run: |
+        echo "🎬 开始生成截图..."
+
+        # 设置时区
+        export TZ=Asia/Shanghai
+
+        # 从最终文件名中提取基础名称（不含扩展名）
+        VIDEO_FILENAME=$(echo "$FINAL_FILENAME" | sed 's/\.[^.]*$//')
+        # 注意：保持中文字符，只清理在文件系统中有问题的字符
+        VIDEO_FILENAME=$(echo "$VIDEO_FILENAME" | sed 's/[<>:"|?*\/\\]/_/g' | sed 's/__*/_/g' | sed 's/^_\|_$//g')
+
+        # 为Docker容器创建ASCII安全的工作文件名（用于内部处理）
+        # 但保持原始文件名用于最终输出
+        DOCKER_SAFE_FILENAME=$(echo "$FINAL_FILENAME" | sed 's/[^a-zA-Z0-9._-]/_/g' | sed 's/__*/_/g' | sed 's/^_\|_$//g')
+        if [ "$DOCKER_SAFE_FILENAME" != "$FINAL_FILENAME" ]; then
+          echo "📝 Docker安全文件名: $DOCKER_SAFE_FILENAME"
+          # 创建ASCII安全的符号链接
+          ln -sf "$FINAL_FILENAME" "video_input/$DOCKER_SAFE_FILENAME"
+        else
+          DOCKER_SAFE_FILENAME="$FINAL_FILENAME"
+        fi
+
+        echo "📝 处理文件: $FINAL_FILENAME"
+        echo "📝 基础文件名: $VIDEO_FILENAME"
+        echo "VIDEO_FILENAME=$VIDEO_FILENAME" >> $GITHUB_ENV
+
+        # 运行 shot-stitch Docker 容器，使用ASCII安全的文件名
+        # 设置UTF-8环境变量以支持中文文件名，并设置时区
+        docker run --rm \
+          -e LANG=C.UTF-8 \
+          -e LC_ALL=C.UTF-8 \
+          -e TZ=Asia/Shanghai \
+          -v $(pwd)/video_input:/data \
+          dreamytzk/shot-stitch:latest \
+          "/data/$DOCKER_SAFE_FILENAME" \
+          --preset ${{ inputs.preset }} \
+          --html \
+          --force \
+          --keep-frames
+
+        # 如果使用了ASCII安全文件名，需要重命名生成的文件
+        if [ "$DOCKER_SAFE_FILENAME" != "$FINAL_FILENAME" ]; then
+          echo "🔄 重命名生成的文件回中文文件名..."
+          DOCKER_SAFE_BASE=$(echo "$DOCKER_SAFE_FILENAME" | sed 's/\.[^.]*$//')
+
+          # 重命名所有生成的文件
+          for file in video_input/${DOCKER_SAFE_BASE}*; do
+            if [ -f "$file" ] && [ "$(basename "$file")" != "$DOCKER_SAFE_FILENAME" ]; then
+              new_name=$(echo "$(basename "$file")" | sed "s/^${DOCKER_SAFE_BASE}/${VIDEO_FILENAME}/")
+              mv "$file" "video_input/$new_name"
+              echo "  重命名: $(basename "$file") → $new_name"
+            fi
+          done
+
+          # 删除ASCII安全的符号链接
+          rm -f "video_input/$DOCKER_SAFE_FILENAME"
+        fi
+
+        # 定义查找生成文件的函数（避免eval）
+        find_generated_files() {
+          find video_input/ -type f \( -name "*.webp" -o -name "*.jpg" -o -name "*.png" -o -name "*.html" \) ! -name "$FINAL_FILENAME"
+        }
+
+        # 定义查找小图片文件的函数
+        find_frame_files() {
+          find video_input/ -type f -path "*_frames/*" \( -name "*.webp" -o -name "*.jpg" -o -name "*.png" \)
+        }
+
+        # 检查生成的文件
+        SCREENSHOT_COUNT=$(find_generated_files | wc -l)
+        FRAME_COUNT=$(find_frame_files | wc -l)
+
+        if [ "$SCREENSHOT_COUNT" -eq 0 ]; then
+          echo "❌ 没有生成任何截图文件"
+          exit 1
+        fi
+
+        echo "✅ 截图生成完成，共生成 $SCREENSHOT_COUNT 个主文件"
+        if [ "$FRAME_COUNT" -gt 0 ]; then
+          echo "✅ 保留了 $FRAME_COUNT 张小图片"
+        fi
+
+        # 列出生成的文件
+        echo "📊 生成的主文件:"
+        find_generated_files | while read file; do
+          echo "  - $(basename "$file") ($(du -h "$file" | cut -f1))"
+        done
+
+        if [ "$FRAME_COUNT" -gt 0 ]; then
+          echo "📊 保留的小图片:"
+          find_frame_files | head -5 | while read file; do
+            echo "  - $(basename "$file") ($(du -h "$file" | cut -f1))"
+          done
+          if [ "$FRAME_COUNT" -gt 5 ]; then
+            echo "  - ... 还有 $((FRAME_COUNT - 5)) 张小图片"
+          fi
+        fi
+    
+    - name: 准备 Release 信息
+      env:
+        TZ: Asia/Shanghai
+      run: |
+        TIMESTAMP=$(TZ="Asia/Shanghai" date +"%Y%m%d_%H%M%S")
+        RELEASE_TAG="screenshots-${TIMESTAMP}"
+        RELEASE_NAME="$VIDEO_FILENAME 截图 - $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
+        TARGET_REPO="${{ inputs.target_repo }}"
+
+        echo "TIMESTAMP=$TIMESTAMP" >> $GITHUB_ENV
+        echo "RELEASE_TAG=$RELEASE_TAG" >> $GITHUB_ENV
+        echo "RELEASE_NAME=$RELEASE_NAME" >> $GITHUB_ENV
+        echo "TARGET_REPO=$TARGET_REPO" >> $GITHUB_ENV
+
+        # 创建 Release 描述
+        echo "# 视频截图文件" > release_notes.md
+        echo "" >> release_notes.md
+        echo "**视频文件名**: \`$VIDEO_FILENAME\`" >> release_notes.md
+        # 如果使用了自定义文件名或进行了URL解码，显示原始URL文件名
+        if [ -n "${{ inputs.custom_filename }}" ] || [[ "$URL_FILENAME" =~ %[0-9A-Fa-f]{2} ]]; then
+          echo "**原始URL文件名**: \`$URL_FILENAME\`" >> release_notes.md
+        fi
+        echo "**预设模式**: \`${{ inputs.preset }}\`" >> release_notes.md
+        echo "**目标仓库**: \`$TARGET_REPO\`" >> release_notes.md
+        echo "**生成时间**: \`$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')\`" >> release_notes.md
+        echo "" >> release_notes.md
+        echo "## 包含文件" >> release_notes.md
+
+        # 收集预览图文件（与上传逻辑保持一致）
+        preview_files=()
+        while IFS= read -r -d '' file; do
+          filename=$(basename "$file")
+          if [ "$filename" != "$FINAL_FILENAME" ]; then
+            preview_files+=("$file")
+          fi
+        done < <(find video_input/ -maxdepth 1 -type f \( -name "*.webp" -o -name "*.jpg" -o -name "*.png" \) -print0 2>/dev/null)
+
+        # 添加预览图文件到release notes
+        if [ ${#preview_files[@]} -gt 0 ]; then
+          echo "### 预览图文件" >> release_notes.md
+          for file in "${preview_files[@]}"; do
+            echo "- \`$(basename "$file")\` ($(du -h "$file" | cut -f1))" >> release_notes.md
+          done
+          echo "" >> release_notes.md
+        fi
+
+        # 添加压缩包信息
+        echo "### 压缩包文件" >> release_notes.md
+
+        # 预览图压缩包
+        html_count=$(find video_input/ -maxdepth 1 -type f -name "*.html" | wc -l)
+        if [ ${#preview_files[@]} -gt 0 ] || [ $html_count -gt 0 ]; then
+          echo "- \`${VIDEO_FILENAME}_previews.zip\` (包含所有预览图和HTML报告)" >> release_notes.md
+        fi
+
+        # 小图压缩包（动态查找frames目录）
+        frames_dir=""
+        for dir in video_input/*_frames/; do
+          if [ -d "$dir" ]; then
+            frames_dir="$dir"
+            break
+          fi
+        done
+
+        if [ -n "$frames_dir" ] && [ -d "$frames_dir" ]; then
+          frame_count=$(find "$frames_dir" -type f \( -name "*.webp" -o -name "*.jpg" -o -name "*.png" \) | wc -l)
+          if [ $frame_count -gt 0 ]; then
+            echo "- \`${VIDEO_FILENAME}_frames.zip\` (包含 $frame_count 张小图)" >> release_notes.md
+          fi
+        fi
+
+        echo "" >> release_notes.md
+        echo "- \`${VIDEO_FILENAME}_all_files.zip\` (包含所有文件的压缩包)" >> release_notes.md
+        echo "" >> release_notes.md
+        echo "---" >> release_notes.md
+        echo "*由 GitHub Actions 自动生成*" >> release_notes.md
+
+        echo "✅ Release 信息准备完成"
+    
+    - name: 创建 Release 并上传文件
+      env:
+        TZ: Asia/Shanghai
+        GH_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+      run: |
+        echo "🚀 创建 Release 并上传文件..."
+
+        # 创建 Release
+        gh release create "$RELEASE_TAG" \
+          --repo "$TARGET_REPO" \
+          --title "$RELEASE_NAME" \
+          --notes-file release_notes.md
+
+        echo "✅ Release 创建成功: $RELEASE_TAG"
+
+        # 第一步：收集所有文件信息
+        echo "� 分析生成的文件..."
+
+        # 查找预览图文件（video_input根目录下的图片，排除原始视频）
+        preview_files=()
+        while IFS= read -r -d '' file; do
+          filename=$(basename "$file")
+          if [ "$filename" != "$FINAL_FILENAME" ]; then
+            preview_files+=("$file")
+          fi
+        done < <(find video_input/ -maxdepth 1 -type f \( -name "*.webp" -o -name "*.jpg" -o -name "*.png" \) -print0 2>/dev/null)
+
+        # 查找HTML文件
+        html_files=()
+        while IFS= read -r -d '' file; do
+          html_files+=("$file")
+        done < <(find video_input/ -maxdepth 1 -type f -name "*.html" -print0 2>/dev/null)
+
+        # 动态查找小图文件夹（可能有不同的命名）
+        frames_dir=""
+        for dir in video_input/*_frames/; do
+          if [ -d "$dir" ]; then
+            frames_dir="$dir"
+            break
+          fi
+        done
+
+        echo "📊 文件统计："
+        echo "  - 预览图文件: ${#preview_files[@]} 个"
+        echo "  - HTML文件: ${#html_files[@]} 个"
+        if [ -n "$frames_dir" ] && [ -d "$frames_dir" ]; then
+          frame_count=$(find "$frames_dir" -type f \( -name "*.webp" -o -name "*.jpg" -o -name "*.png" \) | wc -l)
+          echo "  - 小图文件: $frame_count 个 (目录: $(basename "$frames_dir"))"
+        else
+          echo "  - 小图文件: 0 个（未找到frames目录）"
+        fi
+
+        # 第二步：上传预览图文件
+        if [ ${#preview_files[@]} -gt 0 ]; then
+          echo "📤 上传预览图文件..."
+          for i in "${!preview_files[@]}"; do
+            file="${preview_files[$i]}"
+            filename=$(basename "$file")
+            echo "📤 上传第$((i+1))张预览图: $filename"
+
+            gh release upload "$RELEASE_TAG" "$file" \
+              --repo "$TARGET_REPO" \
+              --clobber
+          done
+        fi
+
+        # 第三步：创建并上传预览图压缩包
+        if [ ${#preview_files[@]} -gt 0 ] || [ ${#html_files[@]} -gt 0 ]; then
+          echo "📦 创建预览图压缩包..."
+          mkdir -p temp_previews
+
+          # 复制预览图文件
+          for file in "${preview_files[@]}"; do
+            cp "$file" temp_previews/
+          done
+
+          # 复制HTML文件
+          for file in "${html_files[@]}"; do
+            cp "$file" temp_previews/
+          done
+
+          cd temp_previews
+          previews_zip_filename="${VIDEO_FILENAME}_previews.zip"
+          zip -r "$previews_zip_filename" . >/dev/null
+          echo "📤 上传预览图压缩包: $previews_zip_filename"
+
+          gh release upload "$RELEASE_TAG" "$previews_zip_filename" \
+            --repo "$TARGET_REPO" \
+            --clobber
+          cd ..
+        fi
+
+        # 第四步：创建并上传小图压缩包
+        if [ -n "$frames_dir" ] && [ -d "$frames_dir" ]; then
+          frame_files=($(find "$frames_dir" -type f \( -name "*.webp" -o -name "*.jpg" -o -name "*.png" \)))
+          if [ ${#frame_files[@]} -gt 0 ]; then
+            echo "📦 创建小图压缩包..."
+            mkdir -p temp_frames
+
+            # 复制所有小图文件
+            for file in "${frame_files[@]}"; do
+              cp "$file" temp_frames/
+            done
+
+            cd temp_frames
+            frames_zip_filename="${VIDEO_FILENAME}_frames.zip"
+            zip -r "$frames_zip_filename" . >/dev/null
+            echo "📤 上传小图压缩包: $frames_zip_filename (包含 ${#frame_files[@]} 个文件)"
+
+            gh release upload "$RELEASE_TAG" "$frames_zip_filename" \
+              --repo "$TARGET_REPO" \
+              --clobber
+            cd ..
+          else
+            echo "ℹ️ 小图文件夹为空，跳过小图压缩包创建"
+          fi
+        else
+          echo "ℹ️ 未找到小图文件夹，跳过小图压缩包创建"
+        fi
+
+        echo "✅ 所有文件上传完成"
+        echo "RELEASE_URL=https://github.com/$TARGET_REPO/releases/tag/$RELEASE_TAG" >> $GITHUB_ENV
+
+    
+    - name: 生成下载信息
+      env:
+        TZ: Asia/Shanghai
+      run: |
+        echo "🎉 截图已成功上传到目标仓库!"
+        echo ""
+        echo "📍 目标仓库: $TARGET_REPO"
+        echo "🏷️  Release 标签: $RELEASE_TAG"
+        echo "🔗 Release 链接: $RELEASE_URL"
+        echo ""
+        echo "📥 下载方式:"
+        echo "1. 访问目标仓库的 Releases 页面"
+        echo "2. 找到标签为 '$RELEASE_TAG' 的 Release"
+        echo "3. 直接下载需要的文件（无需解压）"
+        echo ""
+
+        echo "📊 包含文件:"
+
+        # 重新收集文件信息（与上传逻辑保持一致）
+        # 查找预览图文件
+        uploaded_preview_files=()
+        while IFS= read -r -d '' file; do
+          filename=$(basename "$file")
+          if [ "$filename" != "$FINAL_FILENAME" ]; then
+            uploaded_preview_files+=("$file")
+          fi
+        done < <(find video_input/ -maxdepth 1 -type f \( -name "*.webp" -o -name "*.jpg" -o -name "*.png" \) -print0 2>/dev/null)
+
+        # 显示上传的预览图文件
+        for file in "${uploaded_preview_files[@]}"; do
+          filename=$(basename "$file")
+          size=$(du -h "$file" | cut -f1)
+          echo "  - $filename ($size)"
+        done
+
+        # 显示预览图压缩包（如果有预览图或HTML文件）
+        html_count=$(find video_input/ -maxdepth 1 -type f -name "*.html" | wc -l)
+        if [ ${#uploaded_preview_files[@]} -gt 0 ] || [ $html_count -gt 0 ]; then
+          echo "  - ${VIDEO_FILENAME}_previews.zip"
+        fi
+
+        # 显示小图压缩包（动态查找frames目录）
+        frames_dir=""
+        for dir in video_input/*_frames/; do
+          if [ -d "$dir" ]; then
+            frames_dir="$dir"
+            break
+          fi
+        done
+
+        if [ -n "$frames_dir" ] && [ -d "$frames_dir" ]; then
+          frame_count=$(find "$frames_dir" -type f \( -name "*.webp" -o -name "*.jpg" -o -name "*.png" \) | wc -l)
+          if [ $frame_count -gt 0 ]; then
+            echo "  - ${VIDEO_FILENAME}_frames.zip"
+          fi
+        fi
+
+        echo ""
+        echo "🔒 只有目标仓库的协作者可以访问和下载"
+    
+    - name: 清理临时文件
+      if: always()
+      run: |
+        echo "🧹 清理临时文件..."
+        # 使用 sudo 来处理权限问题，Docker 创建的文件可能有不同的权限
+        sudo rm -rf video_input/ release_notes.md temp_previews/ temp_frames/ || {
+          echo "⚠️ 部分文件清理失败，尝试修改权限后重试..."
+          sudo chmod -R 777 video_input/ 2>/dev/null || true
+          sudo rm -rf video_input/ release_notes.md temp_previews/ temp_frames/ || true
+        }
+        echo "✅ 清理完成"
